@@ -66,23 +66,16 @@ sudo pkill -HUP socketfilterfw
 
 Computer hackers scan networks so they can attempt to identify computers to attack. When stealth mode is enabled, your computer does not respond to ICMP ping requests, and does not answer to connection attempts from a closed TCP or UDP port.
 
-## Disable ipv6 temporarily addresses
-Privacy addresses were disabled by default in versions prior to OS X 10.7. Since then they are enabled by default. To disable their use with a sysctl
-
-```
-sysctl net.inet6.ip6.use_tempaddr=0
-echo "net.inet6.ip6.use_tempaddr=0" >> sudo tee -a /etc/sysctl.conf
-```
-
 # Install required software
 The required software for this guide is:
 
 * Homebrew
 * PAM Yubico
 * YubiKey Personalization Tools
-* GPG 2.1
-* Stubby
+* GPG 2
+* Knot-Resolver
 * OpenSSL
+* LibreSSL
 
 ## Install Homebrew
 Open a Terminal window and then run the following command to install Homebrew:
@@ -100,24 +93,108 @@ The version of Curl which comes with macOS uses Secure Transport for SSL/TLS val
 
 ```
 brew install openssl
-brew install curl --with-openssl
+brew install libressl
+brew install curl
 brew install wget
 ```
 
-## Install stubby
-Stubby is an application that acts as a local DNS Privacy stub resolver (using DNS-over-TLS). Stubby encrypts DNS queries sent from a client machine (desktop or laptop) to a DNS Privacy resolver increasing end user privacy.
+### Configure your shell
+To use LibreSSL and curl installed by Homebrew, it is important to update your path. You can add the following to your shell profile. Currently we're using zsh where the file you need to alter is `~/.zshrc`
+
+Add the following to the file:
 
 ```
-brew install stubby
+export PATH="/usr/local/opt/curl/bin:$PATH"
+export PATH="/usr/local/opt/libressl/bin:$PATH"
 ```
 
-Enable Stubby to start at boot:
+## Install knot-resolver
+Knot Resolver is an application that acts as a local DNS Privacy stub resolver (using DNS-over-TLS). Knot Resolver encrypts DNS queries sent from a client machine (desktop or laptop) to a DNS Privacy resolver increasing end user privacy.
 
 ```
-sudo brew services start stubby
+brew install knot-resolver
 ```
 
-Then enable snobby DNS for each interface
+You will also need some certificates so you're able to use DNS-over-TLS. To install the certificates run the following in a Terminal:
+
+```
+cd /usr/local/etc/kresd
+wget https://secure.globalsign.net/cacert/Root-R2.crt
+wget https://www.digicert.com/CACerts/DigiCertECCSecureServerCA.crt
+openssl x509 -inform der -in Root-R2.crt -out GlobalSignR2CA.pem
+openssl x509 -inform der -in DigiCertECCSecureServerCA.crt -out DigiCertECCSecureServerCA.pem
+```
+
+We then need to setup Knot to use DNS-Over-TLS.
+
+Edit Knot Resolvers configuration file at `/usr/local/etc/kresd/config` and paste in the following content:
+
+```
+-- Listen on localhost (default)
+net = { '127.0.0.1', '::1' }
+
+-- Used for choosing random DNS Provider
+require 'math'
+math.randomseed(os.time())
+
+-- Load Useful modules
+modules = {
+	'hints > iterate', -- Load /etc/hosts and allow custom root hints
+	'stats',
+	'predict',
+   'policy',
+   'serve_stale < cache',
+   'workarounds < iterate',
+}
+
+-- Cache size
+cache.size = 150 * MB
+
+-- Prefetch learning (20-minute blocks over 72 hours)
+predict.config({ window = 20, period = 72})
+
+-- Randomize forwards DNS Queries
+DigiCert_bundle='/usr/local/etc/kresd/DigiCertECCSecureServerCA.pem'
+GlobalSign_bundle='/usr/local/etc/kresd/GlobalSignR2CA.pem'
+
+dns_providers = {
+  {
+    {'1.1.1.1', hostname='cloudflare-dns.com', ca_file=DigiCert_bundle},
+    {'1.0.0.1', hostname='cloudflare-dns.com', ca_file=DigiCert_bundle},
+    {'2606:4700:4700::1111', hostname='cloudflare-dns.com', ca_file=DigiCert_bundle},
+    {'2606:4700:4700::1001', hostname='cloudflare-dns.com', ca_file=DigiCert_bundle},
+  },
+  {
+    {'9.9.9.9', hostname='dns.quad9.net', ca_file=DigiCert_bundle},
+    {'149.112.112.112', hostname='dns.quad9.net', ca_file=DigiCert_bundle},
+    {'2620:fe::fe', hostname='dns.quad9.net', ca_file=DigiCert_bundle},
+    {'2620:fe::9', hostname='dns.quad9.net', ca_file=DigiCert_bundle},
+  },
+  {
+    {'8.8.8.8', hostname='dns.google', ca_file=GlobalSign_bundle},
+    {'8.8.4.4', hostname='dns.google', ca_file=GlobalSign_bundle},
+    {'2001:4860:4860::8888', hostname='dns.google', ca_file=GlobalSign_bundle},
+    {'2001:4860:4860::8844', hostname='dns.google', ca_file=GlobalSign_bundle},
+  }
+}
+
+tls_forwarders = {}
+for n, fwdspec in ipairs(dns_providers) do
+  table.insert(tls_forwarders, policy.TLS_FORWARD(fwdspec))
+end
+
+policy.add(function (request, query)
+  return tls_forwarders[math.random(1, #tls_forwarders)]
+end)
+```
+
+Enable Knot Resolver to start at boot:
+
+```
+sudo brew services start knot-resolver
+```
+
+Then enable Knot Resolver DNS for each interface on your Mac:
 
 ```
 networksetup -listallnetworkservices 2>/dev/null | grep -v '*' | while read x ; do
@@ -126,7 +203,7 @@ done
 ```
 
 ### Block DNS queries
-You should block all connections to other DNS servers as various programs use some sort of internal DNS resolver. Chrome has this build in, lots of programs also falls back to systemd's resolver. So to make sure we always use Stubby as DNS resolver, we simply just block all DNS connections to anything but Stubby:
+You should block all connections to other DNS servers as various programs use some sort of internal DNS resolver. Chrome has this build in, lots of programs also falls back to systemd's resolver. So to make sure we always use Stubby as DNS resolver, we simply just block all DNS connections to anything but Knot Resolver:
 
 Start of by editing `/etc/pf.conf` and add the following line to the **end** of the file:
 
@@ -145,7 +222,7 @@ Verify that the rule is active with:
 pfctl -v -s rules
 ```
 
-### Test Stubby
+### Test Knot Resolver
 A quick test can be done by using dig (or your favorite DNS tool) on the loopback address
 
 ```
@@ -1068,8 +1145,8 @@ gpg> quit
 For pretty much all shells. I use `zsh`, so i alter the `~/.zshrc` file:
 
 ```
-export "GPG_TTY=$(tty)"
-export "SSH_AUTH_SOCK=${HOME}/.gnupg/S.gpg-agent.ssh"
+export GPG_TTY=$(tty)
+export SSH_AUTH_SOCK=$(gpgconf --list-dirs agent-ssh-socket);
 ```
 
 ## Restart
@@ -1095,8 +1172,8 @@ You can now copy this public key to the servers you want to use it on etc.
 # Misc
 Different information and help.
 
-## Lose of Yubikey
-In case you should lose your YubiKey everything is not yet over and data is not yet lost. If you have another YubiKey nearby, you can simply redeploy the secure keys to a new YubiKey.
+## Loss of Yubikey
+In case you lose your YubiKey, everything is not yet over and data is not yet lost. If you have another YubiKey nearby, you can simply redeploy the secure keys to a new YubiKey.
 
 ### Access to private SSH key
 Start by recreating the RAMDisk drive with hdutil as done when you created the keys. Next, copy back all the files from your secure backup you took, to the RAMDisk.
